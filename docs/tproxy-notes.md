@@ -405,3 +405,33 @@ AKENAI_URL=https://api.akenai.ru/c/<token>
 - [mihomo source: tunnel/tunnel.go](https://github.com/MetaCubeX/mihomo/blob/Alpha/tunnel/tunnel.go) — fallback-to-DIRECT when no rule matches
 - [hev.cc: Transparent Proxy with nftables](https://hev.cc/posts/2021/transparent-proxy-with-nftables/)
 - [scenery/mihomo-tproxy-docker](https://github.com/scenery/mihomo-tproxy-docker) — reference nft ruleset
+
+## Incus VPN-only network
+
+The `vpn-only` Incus profile attaches `eth0` to `incusvpn0` (10.79.0.0/24,
+DHCP). Append it after the default profile so its NIC takes precedence:
+
+```sh
+sudo incus profile add <container> vpn-only
+```
+
+An instance-local `eth0` device overrides profiles; remove or update that
+specific override first if one exists. Renew the guest DHCP lease after moving
+networks. Whale's `bobby` uses this profile alongside `default` and `host-nix`.
+
+`networking.tproxy.forward.incusvpn0.port = 18300` sends TCP/UDP to the
+`vpn-only` Mihomo listener, whose `proxy` field forces the independent
+`vpn-only` selector. Choose a provider node or `Dima AMD` in the dashboard;
+`REJECT` disables proxied Internet connectivity. There is no DIRECT/shared-group fallback, and
+normal rules (including RU, AI, QUIC rejection and skip-domain rules) do not
+apply to this listener.
+
+The bridge has no NAT and drops ordinary forwarding for both IP families.
+Private destinations, skipped ports, and non-TCP/UDP traffic therefore cannot
+escape via direct forwarding. HTTP/HTTPS on the host itself (TCP 80/443),
+including websites resolving to its public IP, is accessed directly and remains
+subject to the normal host firewall. Other host services are blocked except
+DHCP and replies to host-initiated connections; host DNS and explicit proxy
+listeners remain inaccessible. Guests use public DNS (1.1.1.1) through
+the same listener. Same-bridge layer-2 traffic is not isolated; this network is
+for trusted guests requiring a dedicated outbound policy.
