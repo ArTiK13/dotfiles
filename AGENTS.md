@@ -72,6 +72,7 @@ When adding or migrating packages, first trace the current machine's import chai
 
 ## CONVENTIONS
 
+- Deploy from the current working tree, including all current uncommitted changes. These changes may already be running on the target host. Do not deploy from HEAD, a clean checkout, or a filtered snapshot to isolate your task: doing so can accidentally roll back the user's live changes. Preserve existing edits and use the current repo with `./deploy.sh <hostname> ...` unless the user explicitly requests another source.
 - Prefer relative imports for `roles/`, `profiles/`, and same-directory files.
 - `flake.nix` auto-discovers `machines/`, `hardware/`, and `modules/`. New files there need no manual registration. `roles/`, `profiles/`, and `apps/` still require explicit imports.
 - Machines normally import a top-level role (`roles/desktop`, `roles/server.nix`, `roles/family.nix`). `lizard` is the intentional exception and imports `roles/core` directly.
