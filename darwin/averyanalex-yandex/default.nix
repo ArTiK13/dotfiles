@@ -101,8 +101,7 @@
       programs.home-manager.enable = true;
       programs.ssh.settings = {
         yandex-ml-inference = inputs.home-manager.lib.hm.dag.entryBefore [ "yandex" ] {
-          header = "Host ml-inference-gpu-vm-a100-4.sas.yp-c.yandex.net";
-          HostName = "ml-inference-gpu-vm-a100-4.sas.yp-c.yandex.net";
+          header = "Host ml-inference-gpu-vm-a100-4.sas.yp-c.yandex.net ml-inference-dev-2.vla.yp-c.yandex.net";
           IdentityAgent = "~/.skotty/sock/default.sock";
           ForwardAgent = "~/.skotty/sock/default.sock";
           IdentitiesOnly = "no";
