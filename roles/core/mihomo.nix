@@ -304,8 +304,8 @@ in
               interval = 300;
               lazy = true;
               proxies = [
-                "__USA"
                 "__Canada"
+                "__USA"
                 "Dima AMD"
                 "Proxy"
               ];
