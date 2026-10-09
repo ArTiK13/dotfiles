@@ -123,6 +123,28 @@ in
             allow-when-locked = true;
           };
 
+        # Playback controls for the active MPRIS player
+        "XF86AudioPlay" = dms-ipc [
+          "mpris"
+          "playPause"
+        ];
+        "XF86AudioPause" = dms-ipc [
+          "mpris"
+          "pause"
+        ];
+        "XF86AudioNext" = dms-ipc [
+          "mpris"
+          "next"
+        ];
+        "XF86AudioPrev" = dms-ipc [
+          "mpris"
+          "previous"
+        ];
+        "XF86AudioStop" = dms-ipc [
+          "mpris"
+          "stop"
+        ];
+
         # DMS OSD controls
         "XF86AudioRaiseVolume" =
           (dms-ipc [
