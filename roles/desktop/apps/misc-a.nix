@@ -1,4 +1,4 @@
-{ pkgs, ... }:
+{ inputs, pkgs, ... }:
 {
   hm = {
     home.packages = with pkgs; [
@@ -9,6 +9,7 @@
       # webcord-vencord # discord client
       # telegram-desktop # telegram client
       ayugram-desktop
+      inputs.llm-agents.packages.${pkgs.stdenv.hostPlatform.system}.chatgpt
 
       # Creativity
       # libsForQt5.kdenlive # video editor
