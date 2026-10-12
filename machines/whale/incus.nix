@@ -3,6 +3,8 @@ let
   hostAddress = "95.165.105.90";
   machineAddress = "10.78.0.15";
   sshForwardPort = 17428;
+  sailorAddress = "10.77.0.116";
+  sailorSSHPort = 8364;
   btrfsPoolPath = "/var/lib/incus-btrfs";
 
   direnvConfig = pkgs.writeTextDir "etc/direnv/direnvrc" ''
@@ -128,12 +130,22 @@ in
 
   systemd.network.networks."40-incusbr0".dhcpServerStaticLeases = [
     {
+      MACAddress = "10:66:6a:d2:2f:0f";
+      Address = sailorAddress;
+    }
+    {
       MACAddress = "10:66:6a:0e:1d:78";
       Address = "10.77.0.45";
     }
   ];
 
   networking.nat.forwardPorts = [
+    {
+      sourcePort = sailorSSHPort;
+      proto = "tcp";
+      destination = "${sailorAddress}:22";
+      loopbackIPs = [ hostAddress ];
+    }
     {
       sourcePort = sshForwardPort;
       proto = "tcp";

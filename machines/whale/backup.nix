@@ -37,6 +37,8 @@
         # Both nested filesystems are deliberately left out for now.
         "/home/alex/tank/hot"
         "/home/alex/tank/cold"
+        # Sailor data is intentionally excluded from the tank backup.
+        "/home/alex/tank/incus-sailor-data"
         # Do not traverse local snapshot history or back up trash/cache.
         "**/.snapshots"
         "/home/alex/tank/.Trash-1000"
