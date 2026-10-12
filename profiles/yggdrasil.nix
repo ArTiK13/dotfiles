@@ -1,9 +1,12 @@
 {
   config,
+  inputs,
   lib,
   ...
 }:
 {
+  imports = [ inputs.self.nixosModules.modules.yggdrasil-ng ];
+
   # Yggdrasil's 0200::/7 subnet must never be proxied — traffic to mesh
   # peers is overlay-internal and sending it through mihomo would either
   # fail or add pointless latency.
@@ -16,48 +19,30 @@
   # the mark-set step.
   networking.tproxy.defaults.skipUsers = [ "yggdrasil" ];
 
-  systemd.services.yggdrasil.serviceConfig = {
-    DynamicUser = lib.mkForce false;
-    User = "yggdrasil";
-    Group = "yggdrasil";
-  };
-
-  users.users.yggdrasil = {
-    isSystemUser = true;
-    group = "yggdrasil";
-    uid = 862;
-  };
-  users.groups.yggdrasil.gid = 862;
-
-  services.yggdrasil = {
+  services.yggdrasil-ng = {
     enable = true;
-    openMulticastPort = true;
     settings = {
-      Listen = [
+      listen = [
         "tls://[::]:8362"
         "tcp://[::]:8363"
         "quic://[::]:8364"
       ];
-      Peers = lib.mkIf (config.networking.hostName != "whale") [
+      peers = lib.mkIf (config.networking.hostName != "whale") [
         "quic://ygg-msk-1.averyan.ru:8364"
-        "tls://ygg-msk-1.averyan.ru:8363"
+        "tls://ygg-msk-1.averyan.ru:8362"
       ];
-      IfName = "ygg0";
-      MulticastInterfaces = [
+      if_name = "ygg0";
+      if_mtu = 65535;
+      admin_listen = "tcp://127.0.0.1:9001";
+      max_inbound_links_per_peer = 0;
+      multicast_interfaces = [
         {
-          Port = 9217;
+          port = 9217;
         }
       ];
-      NodeInfo = {
+      node_info = {
         name = "${config.networking.hostName}.averyanalex";
       };
-    };
-    denyDhcpcdInterfaces = [ "ygg0" ];
-  };
-
-  systemd.services.yggdrasil = {
-    serviceConfig = {
-      MemoryMax = "1G";
     };
   };
 
@@ -67,5 +52,8 @@
     8364
     9217
   ];
-  networking.firewall.allowedUDPPorts = [ 8364 ];
+  networking.firewall.allowedUDPPorts = [
+    8364
+    9001 # Multicast discovery uses UDP 9001; the admin API is loopback TCP.
+  ];
 }

@@ -421,8 +421,8 @@ in
     };
   */
 
-  services.yggdrasil.settings = {
-    Peers = [
+  services.yggdrasil-ng.settings = {
+    peers = [
       "tcp://yggdrasil.community.garage.networks.deavmi.assigned.network:2000"
       "tcp://sin.yuetau.net:6642"
       "tcp://195.123.245.146:7743"

@@ -1,0 +1,910 @@
+diff --git a/crates/ironwood/src/core.rs b/crates/ironwood/src/core.rs
+index c8f470b..58ee5e3 100644
+--- a/crates/ironwood/src/core.rs
++++ b/crates/ironwood/src/core.rs
+@@ -447,6 +447,7 @@ async fn handle_router_msg(
+                     let cost = router.get_cost(entry.id);
+                     result.push(PeerInfo {
+                         key: *key,
++                        id: entry.id,
+                         port: entry.port,
+                         priority: entry.prio,
+                         latency_ms,
+@@ -675,6 +676,90 @@ impl crate::types::PacketConn for PacketConnImpl {
+     }
+ 
+     async fn handle_conn(&self, key: Addr, conn: Box<dyn AsyncConn>, prio: u8) -> Result<()> {
++        self.handle_conn_with_id(key, conn, prio, None).await
++    }
++
++    fn is_closed(&self) -> bool {
++        self.closed.load(Ordering::Relaxed)
++    }
++
++    fn private_key(&self) -> &SigningKey {
++        &self.signing_key
++    }
++
++    fn mtu(&self) -> u64 {
++        let traffic = wire::Traffic {
++            path: vec![],
++            from: vec![],
++            source: [0; 32],
++            dest: [0; 32],
++            watermark: u64::MAX,
++            payload: vec![],
++        };
++        let overhead = traffic.size() + 1;
++        self.config.peer_max_message_size.saturating_sub(overhead as u64)
++    }
++
++    async fn send_lookup(&self, target: Addr) {
++        if self.closed.load(Ordering::Relaxed) {
++            return;
++        }
++        self.router_handle.send(RouterMsg::SendLookup {
++            our_key: self.pub_key,
++            dest: target.0,
++        });
++    }
++
++    async fn close(&self) -> Result<()> {
++        if self
++            .closed
++            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
++            .is_err()
++        {
++            return Err(Error::Closed);
++        }
++
++        // Cancel all background tasks (including router actor)
++        self.cancel.cancel();
++
++        // Close all peer connections
++        let handles: Vec<(PublicKey, Vec<u64>)> = {
++            let peers = self.peers.lock().await;
++            peers
++                .handles
++                .iter()
++                .map(|(k, m)| (*k, m.keys().copied().collect()))
++                .collect()
++        };
++
++        for (_key, peer_ids) in &handles {
++            let peers = self.peers.lock().await;
++            for &id in peer_ids {
++                if let Some(handle) = peers.get_handle(id) {
++                    handle.cancel.cancel();
++                }
++            }
++        }
++
++        Ok(())
++    }
++
++    fn local_addr(&self) -> Addr {
++        Addr(self.pub_key)
++    }
++}
++
++impl PacketConnImpl {
++    /// Same as [`PacketConn::handle_conn`], but reports the per-link peer id
++    /// through `id_tx` as soon as it is allocated. Several links may share one
++    /// public key; the id is what tells their `get_peers()` entries apart.
++    pub async fn handle_conn_with_id(
++        &self,
++        key: Addr,
++        conn: Box<dyn AsyncConn>,
++        prio: u8,
++        id_tx: Option<oneshot::Sender<u64>>,
++    ) -> Result<()> {
+         if self.closed.load(Ordering::Relaxed) {
+             return Err(Error::Closed);
+         }
+@@ -707,6 +792,9 @@ impl crate::types::PacketConn for PacketConnImpl {
+         };
+ 
+         let peer_id = handle.id;
++        if let Some(tx) = id_tx {
++            let _ = tx.send(peer_id);
++        }
+         let entry = handle.to_entry();
+         let port = handle.port;
+         let traffic_queue = handle.traffic_queue.clone();
+@@ -778,75 +866,6 @@ impl crate::types::PacketConn for PacketConnImpl {
+ 
+         result
+     }
+-
+-    fn is_closed(&self) -> bool {
+-        self.closed.load(Ordering::Relaxed)
+-    }
+-
+-    fn private_key(&self) -> &SigningKey {
+-        &self.signing_key
+-    }
+-
+-    fn mtu(&self) -> u64 {
+-        let traffic = wire::Traffic {
+-            path: vec![],
+-            from: vec![],
+-            source: [0; 32],
+-            dest: [0; 32],
+-            watermark: u64::MAX,
+-            payload: vec![],
+-        };
+-        let overhead = traffic.size() + 1;
+-        self.config.peer_max_message_size.saturating_sub(overhead as u64)
+-    }
+-
+-    async fn send_lookup(&self, target: Addr) {
+-        if self.closed.load(Ordering::Relaxed) {
+-            return;
+-        }
+-        self.router_handle.send(RouterMsg::SendLookup {
+-            our_key: self.pub_key,
+-            dest: target.0,
+-        });
+-    }
+-
+-    async fn close(&self) -> Result<()> {
+-        if self
+-            .closed
+-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+-            .is_err()
+-        {
+-            return Err(Error::Closed);
+-        }
+-
+-        // Cancel all background tasks (including router actor)
+-        self.cancel.cancel();
+-
+-        // Close all peer connections
+-        let handles: Vec<(PublicKey, Vec<u64>)> = {
+-            let peers = self.peers.lock().await;
+-            peers
+-                .handles
+-                .iter()
+-                .map(|(k, m)| (*k, m.keys().copied().collect()))
+-                .collect()
+-        };
+-
+-        for (_key, peer_ids) in &handles {
+-            let peers = self.peers.lock().await;
+-            for &id in peer_ids {
+-                if let Some(handle) = peers.get_handle(id) {
+-                    handle.cancel.cancel();
+-                }
+-            }
+-        }
+-
+-        Ok(())
+-    }
+-
+-    fn local_addr(&self) -> Addr {
+-        Addr(self.pub_key)
+-    }
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -882,6 +901,9 @@ pub struct DebugSnapshot {
+ #[derive(Clone, Debug)]
+ pub struct PeerInfo {
+     pub key: [u8; 32],
++    /// Per-link id. Unique across links, including several links to the same
++    /// `key` — which share one `port`.
++    pub id: u64,
+     pub port: u64,
+     pub priority: u8,
+     pub latency_ms: f64,
+diff --git a/crates/ironwood/src/encrypted/mod.rs b/crates/ironwood/src/encrypted/mod.rs
+index 2d53838..db5aed6 100644
+--- a/crates/ironwood/src/encrypted/mod.rs
++++ b/crates/ironwood/src/encrypted/mod.rs
+@@ -182,6 +182,19 @@ impl EncryptedPacketConn {
+     pub fn force_refresh(&self) {
+         self.inner.force_refresh();
+     }
++
++    /// Like `handle_conn`, but reports the per-link peer id through `id_tx` once
++    /// it is allocated, so callers holding several links to one key can tell the
++    /// resulting `get_peers()` entries apart.
++    pub async fn handle_conn_with_id(
++        &self,
++        key: Addr,
++        conn: Box<dyn crate::types::AsyncConn>,
++        prio: u8,
++        id_tx: Option<tokio::sync::oneshot::Sender<u64>>,
++    ) -> Result<()> {
++        self.inner.handle_conn_with_id(key, conn, prio, id_tx).await
++    }
+ }
+ 
+ /// Background reader loop: reads from inner PacketConn, decrypts via sessions, delivers.
+@@ -304,7 +317,7 @@ impl crate::types::PacketConn for EncryptedPacketConn {
+     }
+ 
+     async fn handle_conn(&self, key: Addr, conn: Box<dyn crate::types::AsyncConn>, prio: u8) -> Result<()> {
+-        self.inner.handle_conn(key, conn, prio).await
++        self.inner.handle_conn_with_id(key, conn, prio, None).await
+     }
+ 
+     fn is_closed(&self) -> bool {
+diff --git a/crates/ironwood/tests/integration.rs b/crates/ironwood/tests/integration.rs
+index 174cfc3..d9c2c73 100644
+--- a/crates/ironwood/tests/integration.rs
++++ b/crates/ironwood/tests/integration.rs
+@@ -456,3 +456,89 @@ async fn silent_peer_is_probed_before_disconnect() {
+         "single-probe peer survived {no_retry:?}, expected a prompt drop"
+     );
+ }
++
++/// Two links to the same neighbour must both stay up, share one peer port (so
++/// the tree still sees a single logical neighbour) and be told apart by their
++/// per-link id. Losing one link must not cost us the neighbour.
++#[tokio::test]
++async fn two_links_to_one_peer() {
++    let node_a = new_packet_conn(SigningKey::generate(&mut OsRng), Config::default());
++    let node_b = new_packet_conn(SigningKey::generate(&mut OsRng), Config::default());
++
++    let addr_a = node_a.local_addr();
++    let addr_b = node_b.local_addr();
++
++    // Two independent duplex streams between the same pair of nodes.
++    let mut a_tasks = Vec::new();
++    for _ in 0..2 {
++        let (sa, sb) = tokio::io::duplex(1 << 16);
++        let (a2, b2) = (node_a.clone(), node_b.clone());
++        a_tasks.push(tokio::spawn(async move {
++            let _ = a2.handle_conn(addr_b, Box::new(sa), 0).await;
++        }));
++        tokio::spawn(async move {
++            let _ = b2.handle_conn(addr_a, Box::new(sb), 0).await;
++        });
++    }
++
++    /// Wait until `node` reports exactly `want` peers, or give up.
++    async fn wait_for_peers(node: &Arc<PacketConnImpl>, want: usize) -> Vec<ironwood::PeerInfo> {
++        timeout(Duration::from_secs(10), async {
++            loop {
++                let peers = node.get_peers().await;
++                if peers.len() == want {
++                    return peers;
++                }
++                tokio::time::sleep(Duration::from_millis(20)).await;
++            }
++        })
++        .await
++        .unwrap_or_else(|_| panic!("never settled at {want} peers"))
++    }
++
++    for node in [&node_a, &node_b] {
++        let peers = wait_for_peers(node, 2).await;
++        assert_eq!(peers[0].key, peers[1].key, "both links go to the same node");
++        assert_ne!(peers[0].id, peers[1].id, "links need distinct ids");
++        assert_eq!(
++            peers[0].port, peers[1].port,
++            "extra links must reuse the peer port, so the tree sees one neighbour"
++        );
++    }
++
++    // Kill one link: A drops its half, B sees the EOF.
++    a_tasks.remove(0).abort();
++    let survivors = wait_for_peers(&node_b, 1).await;
++    assert_eq!(survivors[0].key, addr_a.0, "the neighbour must survive");
++
++    // Traffic still flows over the remaining link.
++    let node_b2 = node_b.clone();
++    let reader = tokio::spawn(async move {
++        let mut buf = vec![0u8; 4096];
++        loop {
++            match node_b2.read_from(&mut buf).await {
++                Ok((n, from)) if n > 0 && from == addr_a => return buf[..n].to_vec(),
++                Ok(_) => continue,
++                Err(_) => return Vec::new(),
++            }
++        }
++    });
++    let node_a2 = node_a.clone();
++    let sender = tokio::spawn(async move {
++        loop {
++            let _ = node_a2.write_to(b"survivor", &addr_b).await;
++            tokio::time::sleep(Duration::from_millis(200)).await;
++        }
++    });
++
++    let got = timeout(Duration::from_secs(30), reader).await;
++    sender.abort();
++    assert_eq!(
++        got.expect("timeout: nothing arrived over the surviving link")
++            .expect("reader panicked"),
++        b"survivor"
++    );
++
++    node_a.close().await.unwrap();
++    node_b.close().await.unwrap();
++}
+diff --git a/crates/yggdrasil/src/config.rs b/crates/yggdrasil/src/config.rs
+index d87898e..74a45bd 100644
+--- a/crates/yggdrasil/src/config.rs
++++ b/crates/yggdrasil/src/config.rs
+@@ -96,6 +96,14 @@ pub struct Config {
+     #[serde(default = "default_multicast_interfaces")]
+     pub multicast_interfaces: Vec<MulticastInterfaceConfig>,
+ 
++    /// Maximum number of *inbound* links a single remote public key may hold at
++    /// once. Multiple simultaneous links to one peer (tcp + tls + ws + quic) are
++    /// supported; this bounds how many sockets one remote key can pin on us,
++    /// since the remote side chooses how many to open. `0` = unlimited.
++    /// Outbound links are not capped here — they are governed by the `peers` list.
++    #[serde(default = "default_max_inbound_links_per_peer")]
++    pub max_inbound_links_per_peer: usize,
++
+     /// Tunnel routing (CKR) configuration.
+     #[cfg(feature = "ckr")]
+     #[serde(default)]
+@@ -226,6 +234,11 @@ fn default_mtu() -> u64 {
+     65535
+ }
+ 
++fn default_max_inbound_links_per_peer() -> usize {
++    // Enough for one remote peering to us over tcp/tls/ws/quic at once.
++    4
++}
++
+ fn default_node_info() -> toml::Value {
+     toml::Value::Table(toml::map::Map::new())
+ }
+@@ -244,6 +257,7 @@ impl Default for Config {
+             node_info_privacy: false,
+             allowed_public_keys: Vec::new(),
+             multicast_interfaces: default_multicast_interfaces(),
++            max_inbound_links_per_peer: default_max_inbound_links_per_peer(),
+             #[cfg(feature = "ckr")]
+             tunnel_routing: TunnelRoutingConfig::default(),
+             firewall: FirewallConfig::default(),
+diff --git a/crates/yggdrasil/src/config_template.toml b/crates/yggdrasil/src/config_template.toml
+index 1736670..27d50c3 100644
+--- a/crates/yggdrasil/src/config_template.toml
++++ b/crates/yggdrasil/src/config_template.toml
+@@ -75,6 +75,14 @@ if_mtu = 65535
+ # these public keys will be allowed to connect. Leave empty to allow all peers.
+ # allowed_public_keys = []
+ 
++# Maximum number of simultaneous *inbound* links from a single remote public key.
++# Several links to one peer over different transports (tcp + tls + ws + quic) are
++# supported and all stay up; this only bounds how many inbound sockets one remote
++# key can pin on us, since the remote side decides how many to open.
++# 0 = unlimited. Outbound links are not capped here — they are governed by the
++# `peers` list above.
++# max_inbound_links_per_peer = 4
++
+ # Multicast peer discovery — automatically finds and connects to nearby nodes
+ # on the local network without manual configuration.
+ #
+diff --git a/crates/yggdrasil/src/core.rs b/crates/yggdrasil/src/core.rs
+index d46b22b..a9389d3 100644
+--- a/crates/yggdrasil/src/core.rs
++++ b/crates/yggdrasil/src/core.rs
+@@ -88,7 +88,7 @@ impl Core {
+ 
+         let inner = ironwood::new_encrypted_packet_conn(signing_key.clone(), iw_config);
+ 
+-        let active_links = ActiveLinks::new();
++        let active_links = ActiveLinks::new(config.max_inbound_links_per_peer);
+ 
+         // Generate self-signed TLS certificate
+         let tls_material = tls::generate_self_signed_cert(&signing_key)
+@@ -326,8 +326,18 @@ impl Core {
+     }
+ 
+     /// Handle a new peer connection (delegate to ironwood).
+-    pub async fn handle_conn(&self, key: [u8; 32], conn: Box<dyn ironwood::types::AsyncConn>, priority: u8) -> Result<(), ironwood::Error> {
+-        self.inner.handle_conn(Addr(key), conn, priority).await
++    ///
++    /// `id_tx`, if given, receives ironwood's per-link peer id once allocated;
++    /// the link layer uses it to attribute RTT/cost per link when a peer holds
++    /// several links at once.
++    pub async fn handle_conn(
++        &self,
++        key: [u8; 32],
++        conn: Box<dyn ironwood::types::AsyncConn>,
++        priority: u8,
++        id_tx: Option<tokio::sync::oneshot::Sender<u64>>,
++    ) -> Result<(), ironwood::Error> {
++        self.inner.handle_conn_with_id(Addr(key), conn, priority, id_tx).await
+     }
+ 
+     /// Initialize the links with a reference to this core.
+@@ -406,7 +416,13 @@ impl Core {
+         // Merge latency/cost from ironwood router
+         let iw_peers = self.inner.get_peers().await;
+         for p in &mut peers {
+-            if let Some(iw) = iw_peers.iter().find(|ip| ip.key == p.key) {
++            // Match on the per-link id so that several links to one key each get
++            // their own RTT/cost; fall back to the key while the id is unknown
++            // (a link registered but not yet allocated in ironwood).
++            let by_id = p
++                .peer_id
++                .and_then(|id| iw_peers.iter().find(|ip| ip.id == id));
++            if let Some(iw) = by_id.or_else(|| iw_peers.iter().find(|ip| ip.key == p.key)) {
+                 p.latency_ms = iw.latency_ms;
+                 p.cost = iw.cost;
+             }
+@@ -430,6 +446,7 @@ impl Core {
+                     latency_ms: 0.0,
+                     cost: 0,
+                     last_error,
++                    peer_id: None,
+                 });
+             }
+         }
+diff --git a/crates/yggdrasil/src/links.rs b/crates/yggdrasil/src/links.rs
+index 8550786..a26ccf1 100644
+--- a/crates/yggdrasil/src/links.rs
++++ b/crates/yggdrasil/src/links.rs
+@@ -1,7 +1,7 @@
+ use std::collections::HashMap;
+ use std::net::{IpAddr, SocketAddr};
+ use std::pin::Pin;
+-use std::sync::atomic::{ AtomicUsize, Ordering};
++use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+ use std::sync::Arc;
+ use std::task::{Context, Poll};
+ use std::time::{Duration, Instant};
+@@ -377,6 +377,17 @@ impl Drop for CountingStream {
+     }
+ }
+ 
++/// Compare two remote sockets on address, port and (for IPv6) scope id,
++/// ignoring `flowinfo`, which carries no identity and is not always set.
++fn same_socket(a: &SocketAddr, b: &SocketAddr) -> bool {
++    match (a, b) {
++        (SocketAddr::V6(a), SocketAddr::V6(b)) => {
++            a.ip() == b.ip() && a.port() == b.port() && a.scope_id() == b.scope_id()
++        }
++        _ => a == b,
++    }
++}
++
+ /// Snapshot of a link's current state (for admin API).
+ #[derive(Clone, Debug)]
+ pub struct LinkPeerInfo {
+@@ -393,6 +404,9 @@ pub struct LinkPeerInfo {
+     pub latency_ms: f64,
+     pub cost: u64,
+     pub last_error: Option<String>,
++    /// ironwood's per-link peer id, or `None` if not yet known. Several links
++    /// may share `key`; this is what tells their stats apart.
++    pub peer_id: Option<u64>,
+ }
+ 
+ /// Fired when a peer connection is established or lost.
+@@ -409,6 +423,10 @@ pub struct ActiveLinks {
+     inner: Arc<Mutex<ActiveLinksInner>>,
+     pub ban_list: BanList,
+     peer_tx: broadcast::Sender<PeerEvent>,
++    /// Cap on simultaneous *inbound* links per remote key (0 = unlimited).
++    /// Outbound links are uncapped: each one traces back to a `peers` entry in
++    /// the config (or a multicast beacon), which is deduped before dialling.
++    max_inbound_links_per_peer: usize,
+ }
+ 
+ pub struct ActiveLinksInner {
+@@ -416,13 +434,34 @@ pub struct ActiveLinksInner {
+     connections: HashMap<u64, ActiveConn>,
+ }
+ 
++/// Sentinel for "ironwood has not reported a peer id for this link yet".
++pub(crate) const NO_PEER_ID: u64 = u64::MAX;
++
++/// Why [`ActiveLinks::register`] turned a freshly handshaked link away.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum RegisterRefusal {
++    /// A link to this key over this exact remote socket, in this direction,
++    /// is already up — typically two dials that raced.
++    DuplicateSocket,
++    /// The key already holds `max_inbound_links_per_peer` inbound links.
++    InboundLimit,
++}
++
+ struct ActiveConn {
+     uri: String,
++    /// Resolved remote socket, when the transport could report one. Used to tell
++    /// "already linked to this exact socket" from "another link to the same key",
++    /// which the URI string cannot do (multicast URIs embed the interface name).
++    remote_addr: Option<SocketAddr>,
+     inbound: bool,
+     key: [u8; 32],
+     priority: u8,
+     rx: Arc<AtomicUsize>,
+     tx: Arc<AtomicUsize>,
++    /// ironwood's per-link peer id, filled in once `handle_conn` allocates it.
++    /// Used to line each row up with its own RTT/cost when several links share
++    /// one key. `NO_PEER_ID` until known.
++    peer_id: Arc<AtomicU64>,
+     rx_rate: Arc<AtomicUsize>,
+     tx_rate: Arc<AtomicUsize>,
+     last_rx: usize,
+@@ -431,7 +470,7 @@ struct ActiveConn {
+ }
+ 
+ impl ActiveLinks {
+-    pub fn new() -> Self {
++    pub fn new(max_inbound_links_per_peer: usize) -> Self {
+         let (peer_tx, _) = broadcast::channel(16);
+         Self {
+             inner: Arc::new(Mutex::new(ActiveLinksInner {
+@@ -440,28 +479,65 @@ impl ActiveLinks {
+             })),
+             ban_list: BanList::new(),
+             peer_tx,
++            max_inbound_links_per_peer,
+         }
+     }
+ 
+-    async fn register(&self, uri: String, inbound: bool, key: [u8; 32], priority: u8) -> Option<(u64, Arc<AtomicUsize>, Arc<AtomicUsize>)> {
++    async fn register(
++        &self,
++        uri: String,
++        remote_addr: Option<SocketAddr>,
++        inbound: bool,
++        key: [u8; 32],
++        priority: u8,
++    ) -> Result<(u64, Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<AtomicU64>), RegisterRefusal> {
+         let mut inner = self.inner.lock().await;
+-        // Reject duplicate: same key + same direction
+-        if inner.connections.values().any(|c| c.key == key && c.inbound == inbound) {
+-            return None;
++        // Several links to one peer are allowed — the routing core reuses a
++        // single peer port per key — but only over *distinct* remote sockets.
++        // A second link to a socket we already hold in the same direction is a
++        // duplicate: it adds no path diversity and shares fate with the first.
++        // This is the backstop for racing dials, e.g. multicast beacons that
++        // keep arriving (every 1s at first) while a handshake is still in
++        // flight, which would otherwise leave a pile of identical links up.
++        let duplicate_socket = remote_addr.is_some_and(|addr| {
++            inner.connections.values().any(|c| {
++                c.key == key
++                    && c.inbound == inbound
++                    && c.remote_addr.is_some_and(|a| same_socket(&a, &addr))
++            })
++        });
++        if duplicate_socket {
++            return Err(RegisterRefusal::DuplicateSocket);
++        }
++        // Only inbound links are capped, since the remote side chooses how many
++        // of those to open.
++        if inbound
++            && self.max_inbound_links_per_peer > 0
++            && inner
++                .connections
++                .values()
++                .filter(|c| c.key == key && c.inbound)
++                .count()
++                >= self.max_inbound_links_per_peer
++        {
++            return Err(RegisterRefusal::InboundLimit);
+         }
+         let id = inner.next_id;
+         inner.next_id += 1;
+         let rx = Arc::new(AtomicUsize::new(0));
+         let tx = Arc::new(AtomicUsize::new(0));
++        let peer_id = Arc::new(AtomicU64::new(NO_PEER_ID));
+         inner.connections.insert(
+             id,
+             ActiveConn {
+                 uri: uri.clone(),
++                remote_addr,
+                 inbound,
+                 key,
+                 priority,
+                 rx: rx.clone(),
+                 tx: tx.clone(),
++                peer_id: peer_id.clone(),
+                 rx_rate: Arc::new(AtomicUsize::new(0)),
+                 tx_rate: Arc::new(AtomicUsize::new(0)),
+                 last_rx: 0,
+@@ -471,7 +547,7 @@ impl ActiveLinks {
+         );
+         drop(inner);
+         let _ = self.peer_tx.send(PeerEvent::Connected { key, uri, inbound });
+-        Some((id, rx, tx))
++        Ok((id, rx, tx, peer_id))
+     }
+ 
+     async fn unregister(&self, id: u64) {
+@@ -528,10 +604,18 @@ impl ActiveLinks {
+         self.peer_tx.subscribe()
+     }
+ 
+-    /// Check if there is an active connection to the given public key.
+-    pub async fn has_key(&self, key: &[u8; 32]) -> bool {
++    /// Check if there is an active connection to `key` over exactly this remote
++    /// socket. Multiple links per key are allowed, so multicast matches on
++    /// key + socket rather than the key alone: a repeat beacon for a socket we
++    /// already link over is skipped, while the same node seen on a second
++    /// interface (a different scope id, hence a different socket) can still
++    /// link up.
++    pub async fn has_key_addr(&self, key: &[u8; 32], addr: &SocketAddr) -> bool {
+         let inner = self.inner.lock().await;
+-        inner.connections.values().any(|c| &c.key == key)
++        inner
++            .connections
++            .values()
++            .any(|c| &c.key == key && c.remote_addr.as_ref().is_some_and(|a| same_socket(a, addr)))
+     }
+ 
+     /// Get a snapshot of all active connections for the admin API.
+@@ -554,6 +638,10 @@ impl ActiveLinks {
+                 latency_ms: 0.0,
+                 cost: 0,
+                 last_error: None,
++                peer_id: match c.peer_id.load(Ordering::Relaxed) {
++                    NO_PEER_ID => None,
++                    id => Some(id),
++                },
+             })
+             .collect()
+     }
+@@ -1205,7 +1293,8 @@ pub(crate) async fn handle_connection(
+     } else {
+         "outbound"
+     };
+-    let peer_addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
++    let remote_sock = stream.peer_addr().ok();
++    let peer_addr = remote_sock.map(|a| a.to_string()).unwrap_or_default();
+     tracing::info!(
+         "Connected {}: {} @ {} (v{}.{})",
+         direction,
+@@ -1215,14 +1304,34 @@ pub(crate) async fn handle_connection(
+         remote_meta.minor_ver
+     );
+ 
+-    // Register in active links (rejects duplicate key+direction)
++    // Register in active links. Several links per key are fine, as long as they
++    // run over distinct remote sockets; inbound links are additionally capped.
+     let inbound = link_type == LinkType::Incoming;
+-    let (conn_id, rx_counter, tx_counter) = match active
+-        .register(uri.to_string(), inbound, remote_meta.public_key, priority)
++    let (conn_id, rx_counter, tx_counter, peer_id_slot) = match active
++        .register(uri.to_string(), remote_sock, inbound, remote_meta.public_key, priority)
+         .await
+     {
+-        Some(r) => r,
+-        None => return Err("duplicate connection".to_string()),
++        Ok(r) => r,
++        // The caller discards this error on the accept path, so log the refusal
++        // here or it is invisible to the operator.
++        Err(RegisterRefusal::InboundLimit) => {
++            tracing::info!(
++                "Rejected inbound from {} @ {}: max_inbound_links_per_peer reached",
++                remote_addr,
++                peer_addr
++            );
++            return Err("inbound link limit reached for peer".to_string());
++        }
++        Err(RegisterRefusal::DuplicateSocket) => {
++            // Two dials to the same socket raced; dropping the loser is routine.
++            tracing::debug!(
++                "Dropped {} link to {} @ {}: already linked over this socket",
++                direction,
++                remote_addr,
++                peer_addr
++            );
++            return Err("already linked to this peer over this socket".to_string());
++        }
+     };
+ 
+     let conn_start = Instant::now();
+@@ -1230,9 +1339,18 @@ pub(crate) async fn handle_connection(
+     // Wrap stream to count bytes
+     let counting_stream = CountingStream::new(stream, rx_counter, tx_counter);
+ 
++    // ironwood reports the per-link peer id once it has allocated one; record it
++    // so `getPeers` can attribute RTT/cost to the right link.
++    let (id_tx, id_rx) = tokio::sync::oneshot::channel();
++    tokio::spawn(async move {
++        if let Ok(id) = id_rx.await {
++            peer_id_slot.store(id, Ordering::Relaxed);
++        }
++    });
++
+     // Hand off to ironwood (blocks until peer disconnects)
+     let result = core
+-        .handle_conn(remote_meta.public_key, Box::new(counting_stream), priority)
++        .handle_conn(remote_meta.public_key, Box::new(counting_stream), priority, Some(id_tx))
+         .await
+         .map_err(|e| format!("ironwood: {}", e));
+ 
+@@ -1555,4 +1673,151 @@ mod tests {
+         let url = Url::parse("tcp://example.com:12345?maxbackoff=3s").unwrap();
+         assert!(parse_link_options(&url).is_err());
+     }
++
++    /// Register a link with a synthetic URI, no resolved socket.
++    async fn register_link(links: &ActiveLinks, n: usize, inbound: bool, key: [u8; 32]) -> bool {
++        links
++            .register(format!("tcp://[::1]:{}", 9000 + n), None, inbound, key, 0)
++            .await
++            .is_ok()
++    }
++
++    /// Register a link over a concrete remote socket.
++    async fn register_sock(
++        links: &ActiveLinks,
++        sock: SocketAddr,
++        inbound: bool,
++        key: [u8; 32],
++    ) -> Result<u64, RegisterRefusal> {
++        links
++            .register(format!("tls://{}", sock), Some(sock), inbound, key, 0)
++            .await
++            .map(|r| r.0)
++    }
++
++    #[tokio::test]
++    async fn test_inbound_links_capped_per_key() {
++        let links = ActiveLinks::new(3);
++        let key = [7u8; 32];
++
++        let mut ids = Vec::new();
++        for n in 0..3 {
++            let reg = links
++                .register(format!("tcp://[::1]:{}", 9000 + n), None, true, key, 0)
++                .await;
++            ids.push(reg.expect("inbound link below the cap must be accepted").0);
++        }
++
++        // Fourth inbound link to the same key is refused.
++        assert!(!register_link(&links, 3, true, key).await);
++
++        // A different key gets its own budget.
++        assert!(register_link(&links, 4, true, [8u8; 32]).await);
++
++        // Dropping one link frees a slot.
++        links.unregister(ids[0]).await;
++        assert!(register_link(&links, 5, true, key).await);
++    }
++
++    #[tokio::test]
++    async fn test_outbound_links_uncapped() {
++        let links = ActiveLinks::new(1);
++        let key = [7u8; 32];
++
++        // Every outbound link is explicitly configured, so none are refused.
++        for n in 0..8 {
++            assert!(register_link(&links, n, false, key).await);
++        }
++        assert_eq!(links.get_peers().await.len(), 8);
++    }
++
++    #[tokio::test]
++    async fn test_inbound_cap_does_not_block_outbound() {
++        let links = ActiveLinks::new(2);
++        let key = [7u8; 32];
++
++        assert!(register_link(&links, 0, true, key).await);
++        assert!(register_link(&links, 1, true, key).await);
++        assert!(!register_link(&links, 2, true, key).await);
++
++        // The inbound cap is reached, but an outbound link to that key still goes up.
++        assert!(register_link(&links, 3, false, key).await);
++    }
++
++    #[tokio::test]
++    async fn test_unlimited_inbound_links_when_zero() {
++        let links = ActiveLinks::new(0);
++        let key = [7u8; 32];
++        for n in 0..16 {
++            assert!(register_link(&links, n, true, key).await);
++        }
++    }
++
++    /// Two dials that race to the same remote socket must not both stay up:
++    /// the loser is refused, while a link to the *same key* over a different
++    /// socket (another transport, another interface) is still allowed.
++    #[tokio::test]
++    async fn test_duplicate_socket_link_refused() {
++        use std::net::{Ipv6Addr, SocketAddrV6};
++
++        let links = ActiveLinks::new(0);
++        let key = [7u8; 32];
++        let sock = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9001, 0, 2));
++
++        let first = register_sock(&links, sock, false, key).await.unwrap();
++
++        // Same key, same socket, same direction — the racing dial loses.
++        assert_eq!(
++            register_sock(&links, sock, false, key).await,
++            Err(RegisterRefusal::DuplicateSocket)
++        );
++
++        // Same key on another port / another interface / another key: all fine.
++        let other_port = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9002, 0, 2));
++        assert!(register_sock(&links, other_port, false, key).await.is_ok());
++        let other_iface = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9001, 0, 3));
++        assert!(register_sock(&links, other_iface, false, key).await.is_ok());
++        assert!(register_sock(&links, sock, false, [8u8; 32]).await.is_ok());
++
++        // Inbound over that socket is a different link, not a duplicate.
++        assert!(register_sock(&links, sock, true, key).await.is_ok());
++
++        // Once the first link goes away, the socket is free again.
++        links.unregister(first).await;
++        assert!(register_sock(&links, sock, false, key).await.is_ok());
++    }
++
++    /// A link whose transport cannot report a remote socket is never treated as
++    /// a duplicate — there is nothing to compare it against.
++    #[tokio::test]
++    async fn test_links_without_socket_are_not_deduped() {
++        let links = ActiveLinks::new(0);
++        let key = [7u8; 32];
++        for n in 0..4 {
++            assert!(register_link(&links, n, false, key).await);
++        }
++        assert_eq!(links.get_peers().await.len(), 4);
++    }
++
++    #[tokio::test]
++    async fn test_has_key_addr_matches_socket_not_key() {
++        use std::net::{Ipv6Addr, SocketAddrV6};
++
++        let links = ActiveLinks::new(0);
++        let key = [7u8; 32];
++        // Link-local peer reached on interface index 2.
++        let sock = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9001, 0, 2));
++        assert!(links
++            .register("tls://[::1%eth0]:9001".into(), Some(sock), false, key, 0)
++            .await
++            .is_ok());
++
++        assert!(links.has_key_addr(&key, &sock).await);
++        // Same node, but seen on another interface — a distinct socket, so it
++        // is allowed to link again.
++        let other_iface = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9001, 0, 3));
++        assert!(!links.has_key_addr(&key, &other_iface).await);
++        // Same socket, different key.
++        assert!(!links.has_key_addr(&[8u8; 32], &sock).await);
++    }
+ }
+diff --git a/crates/yggdrasil/src/multicast.rs b/crates/yggdrasil/src/multicast.rs
+index 16010ef..27558d7 100644
+--- a/crates/yggdrasil/src/multicast.rs
++++ b/crates/yggdrasil/src/multicast.rs
+@@ -604,17 +604,29 @@ async fn receiver_loop(
+             continue;
+         }
+ 
+-        // Check if we already have a connection to this key
+-        if core.active_links.has_key(&adv.public_key).await {
+-            continue;
+-        }
+-
+         // Get source address info
+         let from_v6 = match from {
+             std::net::SocketAddr::V6(v6) => v6,
+             _ => continue,
+         };
+ 
++        // Skip beacons for a socket we are already linked over. Several links to
++        // one peer are allowed, so this checks key + socket rather than key
++        // alone: the same node reachable on a second interface still links up.
++        let beacon_sock = std::net::SocketAddr::V6(SocketAddrV6::new(
++            *from_v6.ip(),
++            adv.port,
++            0,
++            from_v6.scope_id(),
++        ));
++        if core
++            .active_links
++            .has_key_addr(&adv.public_key, &beacon_sock)
++            .await
++        {
++            continue;
++        }
++
+         // Find the interface this came from and verify hash
+         let scope_id = from_v6.scope_id();
+         let (password, priority, iface_name) = {

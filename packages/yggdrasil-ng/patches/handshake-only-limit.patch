@@ -1,0 +1,170 @@
+--- a/crates/yggdrasil/src/links.rs
++++ b/crates/yggdrasil/src/links.rs
+@@ -8,7 +8,7 @@
+ 
+ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+ use tokio::net::{TcpListener, TcpStream};
+-use tokio::sync::{broadcast, Mutex, Notify, Semaphore};
++use tokio::sync::{broadcast, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
+ use tokio::task::JoinHandle;
+ use tokio_util::sync::CancellationToken;
+ use tokio_rustls::{TlsAcceptor, TlsConnector};
+@@ -168,7 +168,7 @@
+ // back off from.
+ const BACKOFF_RESET_UPTIME: Duration = Duration::from_secs(30);
+ 
+-// Maximum concurrent incoming connections being processed
++// Maximum concurrent incoming handshakes; established links do not consume slots.
+ const MAX_CONCURRENT_INCOMING: usize = 350;
+ 
+ // Connection throttling settings
+@@ -663,7 +663,7 @@
+     rate_handle: Option<JoinHandle<()>>,
+     /// Notifier to wake all sleeping reconnect loops immediately.
+     retry_notify: Arc<Notify>,
+-    /// Global semaphore shared across ALL listeners — enforces total incoming connection limit.
++    /// Global semaphore shared across ALL listeners — bounds simultaneous incoming handshakes only.
+     connection_limiter: Arc<Semaphore>,
+     /// Last error per configured peer URI (shared with reconnect tasks).
+     peer_errors: Arc<Mutex<HashMap<String, Option<String>>>>,
+@@ -776,7 +776,7 @@
+                             let remote_str = format_peer_uri("quic", &remote);
+                             tokio::spawn(async move {
+                                 // The connection-limiter permit rides inside the
+-                                // QuicStream and is released when it drops.
++                                // QuicStream until authentication finishes.
+                                 let _ = handle_connection(
+                                     LinkType::Incoming,
+                                     opts,
+@@ -784,6 +784,7 @@
+                                     &core,
+                                     &active,
+                                     &remote_str,
++                                    None,
+                                 ).await;
+                             });
+                         }
+@@ -866,7 +867,7 @@
+                                 let remote_str = format_peer_uri(&scheme, &remote);
+ 
+                                 tokio::spawn(async move {
+-                                    // Permit is held for the duration of this task
++                                    // Hold the slot only until authentication finishes.
+ 
+                                     // Perform TLS and/or WebSocket handshakes as needed
+                                     let wrapped_stream = match wrap_incoming(stream, acceptor, use_ws, remote).await {
+@@ -885,9 +886,9 @@
+                                         &core,
+                                         &active,
+                                         &remote_str,
++                                        Some(permit),
+                                     ).await;
+-                                    // Permit automatically released when dropped
+-                                    drop(permit);
++                                    // handle_connection releases the handshake slot.
+                                 });
+                             }
+                             Err(e) => {
+@@ -1038,7 +1039,7 @@
+                         peer_errors.lock().await.insert(uri_str.clone(), None);
+ 
+                         let conn_start = Instant::now();
+-                        let result = handle_connection(LinkType::Persistent, options.clone(), wrapped_stream, &core, &active, &uri_str).await;
++                        let result = handle_connection(LinkType::Persistent, options.clone(), wrapped_stream, &core, &active, &uri_str, None).await;
+ 
+                         // Reset backoff on clean shutdown OR if the peering stayed
+                         // up long enough that the disconnect was almost certainly a
+@@ -1133,6 +1134,7 @@
+     core: &Arc<Core>,
+     active: &ActiveLinks,
+     uri: &str,
++    handshake_permit: Option<OwnedSemaphorePermit>,
+ ) -> Result<(), String> {
+     // Get peer IP address for ban checking
+     let peer_ip = match stream.peer_addr() {
+@@ -1283,6 +1285,14 @@
+             active.ban_list.record_failure(ip, "key not allowed").await;
+         }
+         return Err("remote key not allowed".to_string());
++    }
++
++    // Authentication has finished. Established peers do not consume handshake
++    // slots, including QUIC's permit carried by the stream.
++    drop(handshake_permit);
++    #[cfg(feature = "quic")]
++    if let Stream::Quic(ref mut quic_stream) = stream {
++        quic_stream.release_handshake_permit();
+     }
+ 
+     let priority = options.priority.max(remote_meta.priority);
+--- a/crates/yggdrasil/src/multicast.rs
++++ b/crates/yggdrasil/src/multicast.rs
+@@ -713,6 +713,7 @@
+         core,
+         &core.active_links,
+         uri,
++        None,
+     )
+     .await
+     .map_err(|e| format!("handshake: {}", e))
+@@ -784,6 +785,7 @@
+                                     &core,
+                                     &active,
+                                     &remote_str,
++                                    None,
+                                 ).await;
+                             });
+                         }
+--- a/crates/yggdrasil/src/transport/quic.rs
++++ b/crates/yggdrasil/src/transport/quic.rs
+@@ -305,7 +305,7 @@
+ /// `limiter` is the global incoming-connection semaphore shared with the TCP
+ /// listeners. A permit is claimed *before* the TLS handshake runs (matching
+ /// the TCP path) and rides inside the resulting `QuicStream`, so it is held
+-/// for the lifetime of the connection and released on drop.
++/// until Yggdrasil authentication finishes (or the connection fails).
+ pub(crate) async fn quic_listen(
+     bind_addr: SocketAddr,
+     server_config: Arc<rustls::ServerConfig>,
+@@ -430,7 +430,7 @@
+ 
+ /// Wraps a QUIC bidirectional stream as AsyncRead + AsyncWrite, keeping the
+ /// connection (and, on the client side, the endpoint) alive. Incoming streams
+-/// also hold their connection-limiter permit for the connection's lifetime.
++/// also hold their handshake permit until authentication finishes.
+ pub(crate) struct QuicStream {
+     send: quinn::SendStream,
+     recv: quinn::RecvStream,
+@@ -442,6 +442,11 @@
+ }
+ 
+ impl QuicStream {
++    /// Release the incoming slot once the Yggdrasil handshake is authenticated.
++    pub(crate) fn release_handshake_permit(&mut self) {
++        self._permit.take();
++    }
++
+     pub(crate) fn peer_addr(&self) -> SocketAddr {
+         self.remote_addr
+     }
+@@ -509,7 +514,7 @@
+     async fn test_quic_roundtrip() {
+         let (server_config, client_config) = test_configs();
+         let limiter = Arc::new(Semaphore::new(4));
+-        let listener = quic_listen("127.0.0.1:0".parse().unwrap(), server_config, limiter)
++        let listener = quic_listen("127.0.0.1:0".parse().unwrap(), server_config, limiter.clone())
+             .await
+             .expect("listen");
+ 
+@@ -532,6 +537,11 @@
+         let mut client_stream = client_stream.expect("connect");
+         let mut server_stream = server_stream.expect("accept");
+ 
++        // Releasing the authenticated slot must keep the established stream usable.
++        assert_eq!(limiter.available_permits(), 3);
++        server_stream.release_handshake_permit();
++        assert_eq!(limiter.available_permits(), 4);
++
+         // Both sides should see the other's certificate (mutual TLS).
+         assert!(client_stream.peer_cert().is_some(), "client sees server cert");
+         assert!(server_stream.peer_cert().is_some(), "server sees client cert");

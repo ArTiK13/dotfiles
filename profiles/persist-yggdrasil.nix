@@ -4,8 +4,8 @@
   ...
 }:
 {
-  age.secrets.yggdrasil-keys = {
-    file = "${secrets}/yggdrasil/${config.networking.hostName}.age";
+  age.secrets.yggdrasil-ng-keys = {
+    file = "${secrets}/yggdrasil/${config.networking.hostName}-ng.age";
   };
-  services.yggdrasil.settings.PrivateKeyPath = config.age.secrets.yggdrasil-keys.path;
+  services.yggdrasil-ng.privateKeyFile = config.age.secrets.yggdrasil-ng-keys.path;
 }
