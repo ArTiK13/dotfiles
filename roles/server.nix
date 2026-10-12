@@ -1,4 +1,9 @@
-{ pkgs, lib, ... }:
+{
+  config,
+  pkgs,
+  lib,
+  ...
+}:
 {
   imports = [
     ./core
@@ -20,7 +25,9 @@
   };
 
   systemd.targets.network-online.wantedBy = [ "multi-user.target" ];
-  systemd.network.wait-online.enable = true;
+  # NetworkManager hosts (mole) have no networkd-managed uplink to wait for.
+  # The netman profile controls their online-wait policy instead.
+  systemd.network.wait-online.enable = !config.networking.networkmanager.enable;
 
   powerManagement.cpuFreqGovernor = lib.mkDefault "performance";
 
