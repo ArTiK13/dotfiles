@@ -461,12 +461,16 @@ in
             networks = [ network ];
             ip = "${subnet}.5";
             volumes = [ "/persist/${name}/rabbitmq:/var/lib/rabbitmq" ];
-            environments.RABBITMQ_DEFAULT_USER = name;
+            environments = {
+              RABBITMQ_DEFAULT_USER = name;
+              # Keep health-check CLI VMs small on the 36-CPU gVisor host.
+              RABBITMQ_CTL_ERL_ARGS = "+S 1:1 +SDcpu 1 +SDio 1 +A 1" + " +sbwt none +sbwtdcpu none +sbwtdio none";
+            };
             environmentFiles = [ secretFile ];
             healthCmd = "rabbitmq-diagnostics -q ping";
-            healthInterval = "10s";
+            healthInterval = "30s";
             healthTimeout = "10s";
-            healthRetries = 18;
+            healthRetries = 6;
             healthStartPeriod = "15s";
             healthOnFailure = "kill";
             notify = "healthy";

@@ -35,6 +35,8 @@
       "pnpm"
       "rustup"
       "uv"
+      "lima"
+      "qemu"
     ];
 
     casks = [
@@ -52,6 +54,7 @@
       "prismlauncher"
       "freecad"
       "linearmouse"
+      "utm"
     ];
 
     onActivation.cleanup = "uninstall";
@@ -100,6 +103,15 @@
       programs.git.signing.signByDefault = lib.mkForce false;
       programs.home-manager.enable = true;
       programs.ssh.settings = {
+        "lima-default" = {
+          HostName = "127.0.0.1";
+          Port = 53049;
+          User = "averyanalex";
+          IdentityFile = "~/.lima/_config/user";
+          IdentitiesOnly = "yes";
+          ForwardAgent = true;
+        };
+
         yandex-ml-inference = inputs.home-manager.lib.hm.dag.entryBefore [ "yandex" ] {
           header = "Host ml-inference-gpu-vm-a100-4.sas.yp-c.yandex.net ml-inference-dev-2.vla.yp-c.yandex.net";
           IdentityAgent = "~/.skotty/sock/default.sock";
