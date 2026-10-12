@@ -513,6 +513,9 @@ in
 
         chain prerouting {
           type filter hook prerouting priority mangle; policy accept;
+          # Replies from port-forwarded services must return directly to the
+          # client, rather than being intercepted as new outbound traffic.
+          ct direction reply ct status dnat return
           ip daddr @bypass4 return
           ip6 daddr @bypass6 return
           # Packets destined to any of the host's own addresses (WAN, LAN,
